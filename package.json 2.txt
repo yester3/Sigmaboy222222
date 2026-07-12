@@ -1,0 +1,12 @@
+{
+  "name": "clone-bot",
+  "version": "1.0.0",
+  "description": "Bot para clonar servidores de Discord",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.16.3"
+  }
+}
