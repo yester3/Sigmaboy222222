@@ -7,71 +7,56 @@ const {
   TextInputBuilder,
   TextInputStyle,
   ActionRowBuilder,
-  PermissionFlagsBits,
   ChannelType
 } = require("discord.js");
 
-// ---------------------------------------------------------------------------
-// Bot principal – solo responde al comando /clone
-// ---------------------------------------------------------------------------
-const bot = new Client({
-  intents: [GatewayIntentBits.Guilds],
-});
+const bot = new Client({ intents: [GatewayIntentBits.Guilds] });
 
 bot.once("ready", () => {
   console.log(`✅ Bot listo como ${bot.user.tag}`);
-
-  const command = new SlashCommandBuilder()
-    .setName("clone")
-    .setDescription("Clona la estructura de un servidor usando una cuenta puente");
-
-  bot.application.commands.set([command]);
+  bot.application.commands.set([
+    new SlashCommandBuilder()
+      .setName("clone")
+      .setDescription("Clona la estructura de un servidor usando una cuenta puente")
+  ]);
 });
 
-// ---------------------------------------------------------------------------
-// Mostrar el modal al usar /clone
-// ---------------------------------------------------------------------------
 bot.on("interactionCreate", async (interaction) => {
-  if (!interaction.isCommand()) return;
-  if (interaction.commandName !== "clone") return;
+  if (!interaction.isCommand() || interaction.commandName !== "clone") return;
 
   const modal = new ModalBuilder()
     .setCustomId("clone-modal")
     .setTitle("Clonar servidor");
 
-  const originInput = new TextInputBuilder()
-    .setCustomId("origin-id")
-    .setLabel("ID del servidor ORIGEN (a copiar)")
-    .setStyle(TextInputStyle.Short)
-    .setRequired(true);
-
-  const tokenInput = new TextInputBuilder()
-    .setCustomId("user-token")
-    .setLabel("Token de la cuenta puente")
-    .setStyle(TextInputStyle.Short)
-    .setRequired(true);
-
-  const destInput = new TextInputBuilder()
-    .setCustomId("dest-id")
-    .setLabel("ID del servidor DESTINO (donde pegar)")
-    .setStyle(TextInputStyle.Short)
-    .setRequired(true);
-
   modal.addComponents(
-    new ActionRowBuilder().addComponents(originInput),
-    new ActionRowBuilder().addComponents(tokenInput),
-    new ActionRowBuilder().addComponents(destInput)
+    new ActionRowBuilder().addComponents(
+      new TextInputBuilder()
+        .setCustomId("origin-id")
+        .setLabel("ID del servidor ORIGEN")
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true)
+    ),
+    new ActionRowBuilder().addComponents(
+      new TextInputBuilder()
+        .setCustomId("user-token")
+        .setLabel("Token de la cuenta puente")
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true)
+    ),
+    new ActionRowBuilder().addComponents(
+      new TextInputBuilder()
+        .setCustomId("dest-id")
+        .setLabel("ID del servidor DESTINO")
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true)
+    )
   );
 
   await interaction.showModal(modal);
 });
 
-// ---------------------------------------------------------------------------
-// Recibir el modal y ejecutar la clonación
-// ---------------------------------------------------------------------------
 bot.on("interactionCreate", async (interaction) => {
-  if (!interaction.isModalSubmit()) return;
-  if (interaction.customId !== "clone-modal") return;
+  if (!interaction.isModalSubmit() || interaction.customId !== "clone-modal") return;
 
   const originId = interaction.fields.getTextInputValue("origin-id");
   const userToken = interaction.fields.getTextInputValue("user-token");
@@ -84,206 +69,198 @@ bot.on("interactionCreate", async (interaction) => {
     await interaction.editReply({ content: `✅ ${result}` });
   } catch (err) {
     console.error(err);
-    await interaction.editReply({
-      content: `❌ Error: ${err.message}`,
-    });
+    await interaction.editReply({ content: `❌ ${err.message}` });
   }
 });
 
 // ---------------------------------------------------------------------------
-// Lógica de clonación
+// Clonación vía API HTTP (funciona con token de usuario)
 // ---------------------------------------------------------------------------
+const API_BASE = "https://discord.com/api/v10";
+
+function apiHeaders(token) {
+  return {
+    Authorization: token,                // sin "Bot" → se autentica como usuario
+    "Content-Type": "application/json",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "X-Super-Properties": Buffer.from(
+      JSON.stringify({ os: "Windows", browser: "Chrome", device: "" })
+    ).toString("base64"),
+  };
+}
+
+async function apiFetch(token, path, options = {}) {
+  const url = `${API_BASE}${path}`;
+  const res = await fetch(url, {
+    ...options,
+    headers: { ...apiHeaders(token), ...options.headers },
+  });
+
+  if (res.status === 429) {
+    const retryAfter = res.headers.get("Retry-After") || 2;
+    await sleep(retryAfter * 1000);
+    return apiFetch(token, path, options);
+  }
+
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(`${res.status} ${res.statusText}: ${body.message || "Error desconocido"}`);
+  }
+
+  return res.json();
+}
+
 async function runClone(originId, userToken, destId) {
-  const userClient = new Client({
-    intents: [
-      GatewayIntentBits.Guilds,
-      GatewayIntentBits.GuildEmojisAndStickers,
-    ],
-  });
+  // Verificar acceso a ambos servidores
+  const originGuild = await apiFetch(userToken, `/guilds/${originId}`).catch(() => null);
+  if (!originGuild) throw new Error("La cuenta no está en el servidor ORIGEN o el ID es inválido.");
 
-  // Login con token de usuario
-  await userClient.login(userToken).catch((e) => {
-    userClient.destroy();
-    throw new Error(`Token inválido o no se pudo iniciar sesión: ${e.message}`);
-  });
+  const destGuild = await apiFetch(userToken, `/guilds/${destId}`).catch(() => null);
+  if (!destGuild) throw new Error("La cuenta no está en el servidor DESTINO o el ID es inválido.");
 
-  // Esperar ready
-  await new Promise((resolve) => userClient.once("ready", resolve));
-
-  const originGuild = userClient.guilds.cache.get(originId);
-  const destGuild = userClient.guilds.cache.get(destId);
-
-  if (!originGuild) {
-    userClient.destroy();
-    throw new Error("La cuenta puente no está en el servidor ORIGEN (ID no encontrado).");
-  }
-  if (!destGuild) {
-    userClient.destroy();
-    throw new Error("La cuenta puente no está en el servidor DESTINO (ID no encontrado).");
-  }
-
-  const destMember = destGuild.members.me;
-  if (!destMember.permissions.has(PermissionFlagsBits.Administrator)) {
-    userClient.destroy();
-    throw new Error("La cuenta puente necesita permiso de ADMINISTRADOR en el servidor destino.");
+  // Verificar permisos en destino (necesita ADMINISTRADOR o MANAGE_GUILD)
+  const destMember = await apiFetch(userToken, `/guilds/${destId}/members/@me`);
+  const perms = BigInt(destMember.permissions || "0");
+  const ADMIN = 0x8n;
+  const MANAGE_GUILD = 0x20n;
+  if (!(perms & ADMIN) && !(perms & MANAGE_GUILD)) {
+    throw new Error("La cuenta necesita permiso de Administrador o Gestionar Servidor en el destino.");
   }
 
   const steps = [];
 
-  // ----- 1. Copiar nombre e icono -----
+  // 1. Copiar nombre e icono
   try {
-    const iconURL = originGuild.iconURL({ format: "png", size: 512 });
-    let iconData = null;
-    if (iconURL) {
-      const res = await fetch(iconURL);
-      if (res.ok) iconData = Buffer.from(await res.arrayBuffer());
+    const body = { name: originGuild.name };
+    if (originGuild.icon) {
+      const iconURL = `https://cdn.discordapp.com/icons/${originId}/${originGuild.icon}.png?size=512`;
+      const imgRes = await fetch(iconURL);
+      if (imgRes.ok) {
+        const buffer = await imgRes.arrayBuffer();
+        const base64 = `data:image/png;base64,${Buffer.from(buffer).toString("base64")}`;
+        body.icon = base64;
+      }
     }
-    await destGuild.edit({
-      name: originGuild.name,
-      icon: iconData || null,
+    await apiFetch(userToken, `/guilds/${destId}`, {
+      method: "PATCH",
+      body: JSON.stringify(body),
     });
     steps.push("✅ Nombre e icono copiados");
   } catch (e) {
     steps.push(`⚠️ No se pudo copiar nombre/icono: ${e.message}`);
   }
 
-  // ----- 2. Copiar roles (mapear por nombre) -----
-  const roles = originGuild.roles.cache
-    .filter((r) => !r.managed && r.name !== "@everyone")
+  // 2. Obtener roles del origen (sin @everyone, sin managed)
+  const originRoles = (await apiFetch(userToken, `/guilds/${originId}/roles`))
+    .filter(r => !r.managed && r.name !== "@everyone")
     .sort((a, b) => b.position - a.position);
 
-  const roleNameMap = new Map(); // name -> role en destino
-  for (const [, role] of roles) {
+  // Crear roles en destino, mapear nombres
+  const roleMap = new Map(); // nombre -> role objeto destino
+  for (const role of originRoles) {
     try {
-      const existing = destGuild.roles.cache.find((r) => r.name === role.name);
-      if (existing) {
-        roleNameMap.set(role.name, existing);
-        await existing.setPermissions(role.permissions.bitfield);
-        await existing.setColor(role.color);
-        await existing.setHoist(role.hoist);
-        await existing.setMentionable(role.mentionable);
-      } else {
-        const newRole = await destGuild.roles.create({
+      const created = await apiFetch(userToken, `/guilds/${destId}/roles`, {
+        method: "POST",
+        body: JSON.stringify({
           name: role.name,
           color: role.color,
           hoist: role.hoist,
           mentionable: role.mentionable,
-          permissions: role.permissions.bitfield,
-        });
-        roleNameMap.set(role.name, newRole);
-      }
+          permissions: role.permissions,
+        }),
+      });
+      roleMap.set(role.name, created);
     } catch (e) {
-      steps.push(`⚠️ Error con rol "${role.name}": ${e.message}`);
+      steps.push(`⚠️ Error al crear rol "${role.name}": ${e.message}`);
     }
   }
-  steps.push(`✅ Roles copiados: ${roleNameMap.size}/${roles.size}`);
+  steps.push(`✅ Roles copiados: ${roleMap.size}/${originRoles.length}`);
 
-  // ----- 3. Copiar emojis -----
-  const emojis = originGuild.emojis.cache;
+  // 3. Copiar emojis
+  const originEmojis = await apiFetch(userToken, `/guilds/${originId}/emojis`);
   let emojiCount = 0;
-  for (const [, emoji] of emojis) {
+  for (const emoji of originEmojis) {
     try {
-      const existing = destGuild.emojis.cache.find((e) => e.name === emoji.name);
-      if (!existing) {
-        const res = await fetch(emoji.url);
-        if (res.ok) {
-          const buffer = Buffer.from(await res.arrayBuffer());
-          await destGuild.emojis.create({
-            name: emoji.name,
-            attachment: buffer,
-          });
-          emojiCount++;
-        }
-      }
+      const ext = emoji.animated ? "gif" : "png";
+      const emojiURL = `https://cdn.discordapp.com/emojis/${emoji.id}.${ext}`;
+      const imgRes = await fetch(emojiURL);
+      if (!imgRes.ok) continue;
+      const buffer = await imgRes.arrayBuffer();
+      const base64 = `data:image/${ext};base64,${Buffer.from(buffer).toString("base64")}`;
+      await apiFetch(userToken, `/guilds/${destId}/emojis`, {
+        method: "POST",
+        body: JSON.stringify({ name: emoji.name, image: base64 }),
+      });
+      emojiCount++;
       await sleep(500);
     } catch (e) {
       steps.push(`⚠️ Error con emoji "${emoji.name}": ${e.message}`);
     }
   }
-  steps.push(`✅ Emojis copiados: ${emojiCount}/${emojis.size}`);
+  steps.push(`✅ Emojis copiados: ${emojiCount}/${originEmojis.length}`);
 
-  // ----- Función auxiliar para convertir overwrites usando nombres de rol -----
-  function mapOverwrites(overwrites, originGuildId, destGuildId) {
-    const mapped = [];
-    for (const [, ow] of overwrites) {
-      // Si es @everyone, usar el ID del servidor destino
-      if (ow.id === originGuildId) {
-        mapped.push({
-          id: destGuildId,
-          allow: ow.allow.bitfield,
-          deny: ow.deny.bitfield,
-          type: 0, // role
-        });
-        continue;
-      }
-      // Buscar el rol por nombre en el destino
-      const originRole = originGuild.roles.cache.get(ow.id);
-      if (!originRole) continue;
-      const destRole = roleNameMap.get(originRole.name);
-      if (destRole) {
-        mapped.push({
-          id: destRole.id,
-          allow: ow.allow.bitfield,
-          deny: ow.deny.bitfield,
-          type: 0,
-        });
-      }
-      // Si no se encuentra el rol en destino, se omite ese overwrite
-    }
-    return mapped;
-  }
+  // 4. Obtener canales del origen
+  const originChannels = await apiFetch(userToken, `/guilds/${originId}/channels`);
 
-  // ----- 4. Copiar categorías y canales -----
-  const categories = originGuild.channels.cache
-    .filter((c) => c.type === ChannelType.GuildCategory)
+  // Separar categorías y canales sin categoría
+  const categories = originChannels
+    .filter(c => c.type === 4) // GUILD_CATEGORY
+    .sort((a, b) => a.position - b.position);
+  const orphans = originChannels
+    .filter(c => c.type !== 4 && !c.parent_id)
     .sort((a, b) => a.position - b.position);
 
-  for (const [, cat] of categories) {
-    try {
-      const newCat = await destGuild.channels.create({
-        name: cat.name,
-        type: ChannelType.GuildCategory,
-        permissionOverwrites: mapOverwrites(
-          cat.permissionOverwrites.cache,
-          originGuild.id,
-          destGuild.id
-        ),
-      });
-      await sleep(1000);
+  // Función para mapear overwrites por nombre de rol
+  function mapOverwrites(overwrites) {
+    if (!overwrites) return [];
+    return overwrites.map(ow => {
+      if (ow.id === originId) {
+        return { id: destId, type: 0, allow: ow.allow, deny: ow.deny };
+      }
+      const originRole = originRoles.find(r => r.id === ow.id);
+      if (!originRole) return null;
+      const destRole = roleMap.get(originRole.name);
+      if (!destRole) return null;
+      return { id: destRole.id, type: 0, allow: ow.allow, deny: ow.deny };
+    }).filter(Boolean);
+  }
 
-      const childChannels = originGuild.channels.cache
-        .filter(
-          (c) =>
-            c.parentId === cat.id &&
-            (c.type === ChannelType.GuildText || c.type === ChannelType.GuildVoice)
-        )
+  // Crear categorías y sus canales hijos
+  for (const cat of categories) {
+    try {
+      const newCat = await apiFetch(userToken, `/guilds/${destId}/channels`, {
+        method: "POST",
+        body: JSON.stringify({
+          name: cat.name,
+          type: 4,
+          permission_overwrites: mapOverwrites(cat.permission_overwrites),
+        }),
+      });
+      await sleep(800);
+
+      const children = originChannels
+        .filter(c => c.parent_id === cat.id && (c.type === 0 || c.type === 2))
         .sort((a, b) => a.position - b.position);
 
-      for (const [, ch] of childChannels) {
+      for (const ch of children) {
         try {
-          const channelType =
-            ch.type === ChannelType.GuildVoice
-              ? ChannelType.GuildVoice
-              : ChannelType.GuildText;
-
-          await destGuild.channels.create({
+          const channelType = ch.type === 2 ? 2 : 0; // voice o text
+          const body = {
             name: ch.name,
             type: channelType,
-            parent: newCat.id,
-            permissionOverwrites: mapOverwrites(
-              ch.permissionOverwrites.cache,
-              originGuild.id,
-              destGuild.id
-            ),
-            ...(channelType === ChannelType.GuildText && ch.topic ? { topic: ch.topic } : {}),
-            ...(channelType === ChannelType.GuildVoice
-              ? {
-                  bitrate: Math.min(ch.bitrate, destGuild.maximumBitrate),
-                  userLimit: ch.userLimit,
-                }
-              : {}),
+            parent_id: newCat.id,
+            permission_overwrites: mapOverwrites(ch.permission_overwrites),
+          };
+          if (channelType === 0 && ch.topic) body.topic = ch.topic;
+          if (channelType === 2) {
+            body.bitrate = Math.min(ch.bitrate || 64000, destGuild.max_bitrate || 96000);
+            body.user_limit = ch.user_limit || 0;
+          }
+          await apiFetch(userToken, `/guilds/${destId}/channels`, {
+            method: "POST",
+            body: JSON.stringify(body),
           });
-          await sleep(1000);
+          await sleep(800);
         } catch (e) {
           steps.push(`⚠️ Error con canal "${ch.name}": ${e.message}`);
         }
@@ -293,64 +270,41 @@ async function runClone(originId, userToken, destId) {
     }
   }
 
-  // ----- 5. Canales sin categoría -----
-  const noCatChannels = originGuild.channels.cache
-    .filter(
-      (c) =>
-        !c.parentId &&
-        (c.type === ChannelType.GuildText || c.type === ChannelType.GuildVoice)
-    )
-    .sort((a, b) => a.position - b.position);
-
-  for (const [, ch] of noCatChannels) {
+  // Canales sin categoría
+  for (const ch of orphans) {
     try {
-      const channelType =
-        ch.type === ChannelType.GuildVoice
-          ? ChannelType.GuildVoice
-          : ChannelType.GuildText;
-      await destGuild.channels.create({
+      const channelType = ch.type === 2 ? 2 : 0;
+      const body = {
         name: ch.name,
         type: channelType,
-        permissionOverwrites: mapOverwrites(
-          ch.permissionOverwrites.cache,
-          originGuild.id,
-          destGuild.id
-        ),
-        ...(channelType === ChannelType.GuildText && ch.topic ? { topic: ch.topic } : {}),
-        ...(channelType === ChannelType.GuildVoice
-          ? {
-              bitrate: Math.min(ch.bitrate, destGuild.maximumBitrate),
-              userLimit: ch.userLimit,
-            }
-          : {}),
+        permission_overwrites: mapOverwrites(ch.permission_overwrites),
+      };
+      if (channelType === 0 && ch.topic) body.topic = ch.topic;
+      if (channelType === 2) {
+        body.bitrate = Math.min(ch.bitrate || 64000, destGuild.max_bitrate || 96000);
+        body.user_limit = ch.user_limit || 0;
+      }
+      await apiFetch(userToken, `/guilds/${destId}/channels`, {
+        method: "POST",
+        body: JSON.stringify(body),
       });
-      await sleep(1000);
+      await sleep(800);
     } catch (e) {
       steps.push(`⚠️ Error con canal "${ch.name}": ${e.message}`);
     }
   }
 
-  userClient.destroy();
-
-  const finalReport =
-    `**Clonación completada**\n` +
-    steps.join("\n") +
-    `\n\n⚠️ Los permisos de canales usan los roles copiados por nombre. Si había roles con nombres duplicados, puede haber conflictos.`;
-
-  return finalReport;
+  return steps.join("\n") + "\n\n⚠️ Los permisos se mapearon por nombre de rol. Si hay roles duplicados, revisalos manualmente.";
 }
 
 function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-// ---------------------------------------------------------------------------
-// Iniciar el bot
 // ---------------------------------------------------------------------------
 const BOT_TOKEN = process.env.BOT_TOKEN;
 if (!BOT_TOKEN) {
-  console.error("❌ Falta la variable de entorno BOT_TOKEN");
+  console.error("❌ Falta BOT_TOKEN");
   process.exit(1);
 }
-
 bot.login(BOT_TOKEN);
